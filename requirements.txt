@@ -1,0 +1,6 @@
+flask==3.*
+gunicorn==21.*
+sentence-transformers
+scipy
+numpy
+spacy
