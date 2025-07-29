@@ -12,5 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY . .
 
-# Gunicorn als Prod-Server
-CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120", "app:app"]
