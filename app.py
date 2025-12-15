@@ -1,60 +1,77 @@
+# app.py
 from flask import Flask, request, send_file, jsonify, url_for
 import os, tempfile, contextlib, uuid, time
-from semantic_diff import main as generate_report   # Your original script
-from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# import the refactored helper
+from combined_diff import diff_documents
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# Folder to store reports
-REPORT_DIR = os.path.abspath("reports")
-os.makedirs(REPORT_DIR, exist_ok=True)
+# where finished HTML reports live
+REPORT_DIR = Path("reports").resolve()
+REPORT_DIR.mkdir(exist_ok=True)
+
 
 @contextlib.contextmanager
 def tmp_workdir():
+    """Create a throw-away working directory."""
     with tempfile.TemporaryDirectory() as d:
-        cwd_before = os.getcwd()
-        os.chdir(d)
-        try:
-            yield d
-        finally:
-            os.chdir(cwd_before)
+        yield Path(d)            # return as Path object for convenience
+
 
 @app.route("/diff", methods=["POST"])
-def diff():
+def diff_route():
+    # sanity-check the upload
     if "old" not in request.files or "new" not in request.files:
-        return jsonify({"error": "Bitte 'old' und 'new' JSON-Dateien hochladen."}), 400
+        return jsonify({"error": "Bitte sowohl 'old' als auch 'new' hochladen."}), 400
 
-    with tmp_workdir() as work:
-        old_path = os.path.join(work, "old.json")
-        new_path = os.path.join(work, "new.json")
+    with tmp_workdir() as workdir:
+        # save uploads to temp files
+        old_path = workdir / "old.json"
+        new_path = workdir / "new.json"
         request.files["old"].save(old_path)
         request.files["new"].save(new_path)
 
-        generate_report(path_old=old_path, path_new=new_path)
+        # run the diff – let the helper create the HTML inside workdir
+        report_local = diff_documents(
+            old=old_path,
+            new=new_path,
+            out=workdir / "combined_report.html",
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
 
-        # Generate a unique file name
-        filename = f"diff_report_{uuid.uuid4().hex}.html"
-        save_path = os.path.join(REPORT_DIR, filename)
-        os.rename(os.path.join(work, "diff_report.html"), save_path)
+        # move the HTML into our public report folder under a unique name
+        final_name = f"diff_report_{uuid.uuid4().hex}.html"
+        final_path = REPORT_DIR / final_name
+        os.replace(report_local, final_path)
 
-        # Return a link to the file
-        download_url = url_for('download_report', filename=filename, _external=True)
-        return jsonify({"download_url": download_url})
+    # hand back the absolute download URL
+    return jsonify(
+        {"download_url": url_for("download_report", filename=final_name, _external=True)}
+    )
 
-@app.route("/download/<filename>", methods=["GET"])
+
+@app.route("/download/<filename>")
 def download_report(filename):
-    file_path = os.path.join(REPORT_DIR, filename)
-    if not os.path.isfile(file_path):
+    path = REPORT_DIR / filename
+    if not path.is_file():
         return jsonify({"error": "Datei nicht gefunden"}), 404
-    return send_file(file_path, mimetype="text/html", as_attachment=True, download_name=filename)
+    return send_file(path, mimetype="text/html", as_attachment=True, download_name=filename)
 
-# Optional: Cleanup function (run separately, e.g. daily)
-def delete_old_reports(days=30):
-    cutoff = time.time() - days * 86400  # 30 days in seconds
-    for file in os.listdir(REPORT_DIR):
-        path = os.path.join(REPORT_DIR, file)
-        if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
-            os.remove(path)
+
+# housekeeping helper (call from a cron job or similar)
+def delete_old_reports(days: int = 30):
+    cutoff = time.time() - days * 86400
+    for p in REPORT_DIR.iterdir():
+        if p.is_file() and p.stat().st_mtime < cutoff:
+            p.unlink()
+
 
 if __name__ == "__main__":
+    # Flask’s auto-reloader can interfere with tmp dirs; disable if you like
     app.run(host="0.0.0.0", port=8000, debug=True)

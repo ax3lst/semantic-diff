@@ -4,3 +4,7 @@ sentence-transformers
 scipy
 numpy
 spacy
+openai
+tenacity
+markdown
+python-dotenv
