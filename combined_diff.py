@@ -71,6 +71,9 @@ ALIGN_LOG_EVERY    = 100
 DEFAULT_SIM_TAU    = 0.78
 DEFAULT_MIN_WORDS  = 4
 DEFAULT_TABLE_THR  = 0.25
+DEFAULT_POST_MATCH_WINDOW = 3
+DEFAULT_POST_MATCH_SIM = 0.80
+DEFAULT_POST_MATCH_CONTAIN = 0.75
 
 sha256 = lambda t: hashlib.sha256(t.encode()).hexdigest()[:16]
 
@@ -81,11 +84,21 @@ class Chunk:
     id: str
     page: int
     order: int
+    para_id: str
+    para_order: int
     text: str
     norm: str
     hash: str
     emb: Optional[List[float]] = None
     embedding_failed: bool = False     # flagged if embedding API fails
+
+
+@dataclass
+class ParagraphBlock:
+    id: str
+    page: int
+    order: int
+    text: str
 
 
 @dataclass
@@ -299,14 +312,81 @@ def extract_pages_text(di: Dict[str, Any], logger) -> List[Tuple[int, str]]:
         )
     return out
 
+
+def _split_page_into_paragraphs(text: str) -> List[str]:
+    raw = text.strip()
+    if not raw:
+        return []
+    blocks = [b.strip() for b in re.split(r"\n{2,}", raw) if b.strip()]
+    if len(blocks) > 1:
+        return blocks
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        return lines
+    return [raw]
+
+
+def extract_paragraph_blocks(di: Dict[str, Any], logger) -> List[ParagraphBlock]:
+    paragraphs = di.get("paragraphs") if isinstance(di.get("paragraphs"), list) else []
+    tables = di.get("tables") if isinstance(di.get("tables"), list) else []
+
+    blocks: list[ParagraphBlock] = []
+    if paragraphs:
+        tbl_para_idx = _table_paragraph_indices(tables)
+        order_by_page: dict[int, int] = defaultdict(int)
+        for idx, pr in enumerate(paragraphs):
+            if idx in tbl_para_idx:
+                continue
+            if not isinstance(pr, dict):
+                continue
+            if pr.get("role") in _EXCLUDED_ROLES:
+                continue
+            content = _item_text(di, pr).strip()
+            if not content:
+                continue
+            page = _paragraph_page(pr) or 0
+            order_by_page[page] += 1
+            pid = f"p{page}-para{order_by_page[page]}"
+            blocks.append(ParagraphBlock(pid, page, order_by_page[page], content))
+
+        if blocks:
+            pages = {b.page for b in blocks}
+            if len(pages) > 1 and 0 in pages:
+                blocks = [b for b in blocks if b.page != 0]
+            blocks.sort(key=lambda b: (b.page, b.order))
+            return blocks
+
+    # Fallback: split per page text into paragraph-like blocks.
+    pages = extract_pages_text(di, logger)
+    order_by_page: dict[int, int] = defaultdict(int)
+    for page_no, page_txt in pages:
+        for para in _split_page_into_paragraphs(page_txt):
+            order_by_page[page_no] += 1
+            pid = f"p{page_no}-para{order_by_page[page_no]}"
+            blocks.append(ParagraphBlock(pid, page_no, order_by_page[page_no], para))
+    logger.info("Paragraphs extracted via fallback pages[] – %d blocks", len(blocks))
+    return blocks
+
 _soft_hyphen = "\u00ad"
-_join_hyphen_linebreak_rx = re.compile(r"(\w)-\s*\n\s*(\w)")
+# Normalize hyphen + whitespace between word parts (often OCR line breaks).
+_join_hyphen_break_rx = re.compile(r"(\w)-\s+(\w)")
 _space_before_punct_rx = re.compile(r"\s+([%.,;:!?\)\]])")
+
+def _normalize_hyphen_breaks(text: str) -> str:
+    def _repl(m: re.Match[str]) -> str:
+        left = m.group(1)
+        right = m.group(2)
+        # If the next part starts lowercase, treat as discretionary hyphenation.
+        if right.islower():
+            return f"{left}{right}"
+        # Otherwise keep the hyphen but drop whitespace.
+        return f"{left}-{right}"
+    return _join_hyphen_break_rx.sub(_repl, text)
 
 
 def normalize_text(text: str) -> str:
     text = text.replace(_soft_hyphen, "")
-    text = _join_hyphen_linebreak_rx.sub(r"\1\2", text)
+    text = _normalize_hyphen_breaks(text)
     text = re.sub(r"\s*\n\s*", " ", text)
     text = re.sub(r"\s+", " ", text)
     text = _space_before_punct_rx.sub(r"\1", text)
@@ -314,7 +394,7 @@ def normalize_text(text: str) -> str:
 
 def normalize_for_segmentation(text: str) -> str:
     text = text.replace(_soft_hyphen, "")
-    text = _join_hyphen_linebreak_rx.sub(r"\1\2", text)
+    text = _normalize_hyphen_breaks(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t\f\v]+", " ", text)
     return text.strip()
@@ -363,7 +443,7 @@ def split_sentences(text: str) -> List[str]:
 
 
 def chunk_pages(
-    pages: List[Tuple[int, str]],
+    paragraphs: List[ParagraphBlock],
     label: str,
     min_words: int,
     logger,
@@ -373,8 +453,9 @@ def chunk_pages(
     oversize_split = 0
     order_by_page: dict[int, int] = defaultdict(int)
 
-    for page_no, page_txt in pages:
-        for sent in split_sentences(page_txt):
+    for para in paragraphs:
+        page_no = para.page
+        for sent in split_sentences(para.text):
             norm = normalize_text(sent)
             if not norm:
                 dropped_short += 1
@@ -400,11 +481,33 @@ def chunk_pages(
                     order_by_page[page_no] += 1
                     norm = normalize_text(part)
                     cid = f"{label}-p{page_no}-sent{order_by_page[page_no]}-{idx}"
-                    chunks.append(Chunk(cid, page_no, order_by_page[page_no], part, norm, sha256(norm)))
+                    chunks.append(
+                        Chunk(
+                            cid,
+                            page_no,
+                            order_by_page[page_no],
+                            para.id,
+                            para.order,
+                            part,
+                            norm,
+                            sha256(norm),
+                        )
+                    )
             else:
                 order_by_page[page_no] += 1
                 cid = f"{label}-p{page_no}-sent{order_by_page[page_no]}"
-                chunks.append(Chunk(cid, page_no, order_by_page[page_no], sent, norm, sha256(norm)))
+                chunks.append(
+                    Chunk(
+                        cid,
+                        page_no,
+                        order_by_page[page_no],
+                        para.id,
+                        para.order,
+                        sent,
+                        norm,
+                        sha256(norm),
+                    )
+                )
 
     logger.info("%s: %d chunks kept, %d dropped (short), %d split (oversize)",
                 label, len(chunks), dropped_short, oversize_split)
@@ -643,33 +746,296 @@ def align_dp(
     return out
 
 
+_cmp_strip_rx = re.compile(r"[^\w\s]")
+_heading_rx = re.compile(r"^\s*(?:#+\s*)?\d+(?:\.\d+)*\.\s+\S")
+
+
+def _compare_key(text: str) -> str:
+    base = normalize_text(text).lower()
+    base = _cmp_strip_rx.sub("", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
+
+
+def _containment_ratio(old_cmp: str, new_cmp: str) -> float:
+    if not old_cmp:
+        return 0.0
+    sm = SequenceMatcher(None, old_cmp, new_cmp)
+    matched = sum(b.size for b in sm.get_matching_blocks())
+    return matched / max(1, len(old_cmp))
+
+
+def _pages_close(old: Chunk, new: Chunk, *, max_delta: int = 1) -> bool:
+    if old.page <= 0 or new.page <= 0:
+        return True
+    return abs(old.page - new.page) <= max_delta
+
+
+def _is_heading_text(text: str) -> bool:
+    if not text:
+        return False
+    s = normalize_text(text)
+    if not s:
+        return False
+    if _heading_rx.match(s):
+        return True
+    letters = [c for c in s if c.isalpha()]
+    if len(letters) >= 6:
+        upper = sum(1 for c in letters if c.isupper())
+        if upper / len(letters) >= 0.7:
+            return True
+    return False
+
+
+def postprocess_unmatched_pairs(
+    diffs: List[Diff],
+    logger,
+    *,
+    window: int = DEFAULT_POST_MATCH_WINDOW,
+    sim: float = DEFAULT_POST_MATCH_SIM,
+    containment: float = DEFAULT_POST_MATCH_CONTAIN,
+    same_page: bool = True,
+) -> List[Diff]:
+    if window <= 0 or not diffs:
+        return diffs
+
+    used: set[int] = set()
+    pairs: dict[int, tuple[int, Diff]] = {}
+    skip: set[int] = set()
+
+    for i, d in enumerate(diffs):
+        if i in used:
+            continue
+        if d.kind not in ("added", "deleted"):
+            continue
+
+        best_j = None
+        best_ratio = 0.0
+        best_contain = 0.0
+
+        for j in range(i + 1, min(len(diffs), i + window + 1)):
+            if j in used:
+                continue
+            cand = diffs[j]
+            if cand.kind == d.kind or cand.kind not in ("added", "deleted"):
+                continue
+
+            if d.kind == "deleted":
+                old = d.old
+                new = cand.new
+            else:
+                old = cand.old
+                new = d.new
+
+            if old is None or new is None:
+                continue
+            if same_page and not _pages_close(old, new, max_delta=1):
+                continue
+
+            old_cmp = _compare_key(old.text)
+            new_cmp = _compare_key(new.text)
+            if not old_cmp or not new_cmp:
+                continue
+
+            ratio = SequenceMatcher(None, old_cmp, new_cmp).ratio()
+            contain = _containment_ratio(old_cmp, new_cmp)
+            substring = old_cmp in new_cmp and (len(old_cmp) / max(1, len(new_cmp)) >= 0.5)
+
+            if ratio < sim and contain < containment and not substring:
+                continue
+
+            if (ratio > best_ratio) or (ratio == best_ratio and contain > best_contain):
+                best_j = j
+                best_ratio = ratio
+                best_contain = contain
+
+        if best_j is not None:
+            used.add(i)
+            used.add(best_j)
+            other = diffs[best_j]
+            if d.kind == "deleted":
+                old = d.old
+                new = other.new
+            else:
+                old = other.old
+                new = d.new
+            merged = Diff("modified", old=old, new=new, sim=best_ratio)
+            pairs[i] = (best_j, merged)
+            skip.add(best_j)
+            logger.debug(
+                "Post-match paired %s with %s (ratio=%.3f, contain=%.3f, window=%d)",
+                old.id if old else "?",
+                new.id if new else "?",
+                best_ratio,
+                best_contain,
+                best_j - i,
+            )
+
+    if not pairs:
+        return diffs
+
+    out: list[Diff] = []
+    for i, d in enumerate(diffs):
+        if i in pairs:
+            out.append(pairs[i][1])
+            continue
+        if i in skip:
+            continue
+        out.append(d)
+    return out
+
+
+_word_start_rx = re.compile(r"\w")
+
+
+def _is_hyphen_break(left: str, right: str | None) -> bool:
+    if not right:
+        return False
+    if not left.endswith("-") or len(left) < 2:
+        return False
+    if not _word_start_rx.search(left[:-1]):
+        return False
+    return bool(_word_start_rx.match(right))
+
+
+def _group_tokens_for_diff(text: str) -> list[tuple[str, str]]:
+    tokens = text.split()
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if _is_hyphen_break(tok, nxt):
+            display = f"{tok} {nxt}"
+            if nxt and nxt[0].islower():
+                compare = f"{tok[:-1]}{nxt}"
+            else:
+                compare = f"{tok}{nxt}"
+            compare = compare.replace(_soft_hyphen, "")
+            out.append((display, compare))
+            i += 2
+            continue
+        out.append((tok, tok.replace(_soft_hyphen, "")))
+        i += 1
+    return out
+
+
 def _token_diff_two_col_html(old: str, new: str) -> tuple[str, str]:
-    old_words, new_words = old.split(), new.split()
-    sm = SequenceMatcher(None, old_words, new_words)
+    old_groups = _group_tokens_for_diff(old)
+    new_groups = _group_tokens_for_diff(new)
+    old_keys = [k for _, k in old_groups]
+    new_keys = [k for _, k in new_groups]
+    sm = SequenceMatcher(None, old_keys, new_keys)
     out_old: list[str] = []
     out_new: list[str] = []
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         if op == "equal":
-            txt = html.escape(" ".join(old_words[i1:i2]))
-            if txt:
-                out_old.append(txt)
-                out_new.append(txt)
+            old_txt = html.escape(" ".join(t for t, _ in old_groups[i1:i2]))
+            new_txt = html.escape(" ".join(t for t, _ in new_groups[j1:j2]))
+            if old_txt:
+                out_old.append(old_txt)
+            if new_txt:
+                out_new.append(new_txt)
         elif op == "delete":
-            txt = html.escape(" ".join(old_words[i1:i2]))
+            txt = html.escape(" ".join(t for t, _ in old_groups[i1:i2]))
             if txt:
                 out_old.append(f"<del>{txt}</del>")
         elif op == "insert":
-            txt = html.escape(" ".join(new_words[j1:j2]))
+            txt = html.escape(" ".join(t for t, _ in new_groups[j1:j2]))
             if txt:
                 out_new.append(f"<ins>{txt}</ins>")
         elif op == "replace":
-            old_txt = html.escape(" ".join(old_words[i1:i2]))
-            new_txt = html.escape(" ".join(new_words[j1:j2]))
+            old_txt = html.escape(" ".join(t for t, _ in old_groups[i1:i2]))
+            new_txt = html.escape(" ".join(t for t, _ in new_groups[j1:j2]))
             if old_txt:
                 out_old.append(f"<del>{old_txt}</del>")
             if new_txt:
                 out_new.append(f"<ins>{new_txt}</ins>")
     return " ".join(x for x in out_old if x), " ".join(x for x in out_new if x)
+
+
+def _paragraph_group_info(d: Diff) -> tuple[str, str]:
+    old = d.old
+    new = d.new
+    if old and new and old.para_id and new.para_id and old.para_id != new.para_id:
+        label = f"Paragraph {old.para_id} (page {old.page}) → {new.para_id} (page {new.page})"
+        return f"{old.para_id}->{new.para_id}", label
+    ch = old or new
+    if ch and ch.para_id:
+        label = f"Paragraph {ch.para_id}"
+        if ch.page:
+            label += f" (page {ch.page})"
+        return ch.para_id, label
+    return "unknown", "Paragraph (unknown)"
+
+
+def _group_diffs_by_paragraph(diffs: List[Diff]) -> List[tuple[str, str, List[Diff]]]:
+    if not diffs:
+        return []
+    groups: list[tuple[str, str, list[Diff]]] = []
+    current_key = None
+    current_label = None
+    current: list[Diff] = []
+    for d in diffs:
+        key, label = _paragraph_group_info(d)
+        if key != current_key:
+            if current:
+                groups.append((current_key or "unknown", current_label or "", current))
+            current_key = key
+            current_label = label
+            current = [d]
+        else:
+            current.append(d)
+    if current:
+        groups.append((current_key or "unknown", current_label or "", current))
+    return groups
+
+
+def _merge_same_rows(rows: List[dict]) -> List[dict]:
+    if not rows:
+        return rows
+    merged: list[dict] = []
+    i = 0
+    while i < len(rows):
+        cur = rows[i]
+        if cur["kind"] not in {"same", "added", "deleted"} or cur["is_heading"]:
+            merged.append(cur)
+            i += 1
+            continue
+        j = i + 1
+        while j < len(rows):
+            nxt = rows[j]
+            if nxt["kind"] != cur["kind"] or nxt["is_heading"]:
+                break
+            if cur["old_page"] is not None and nxt["old_page"] is not None:
+                if cur["old_page"] != nxt["old_page"]:
+                    break
+            if cur["new_page"] is not None and nxt["new_page"] is not None:
+                if cur["new_page"] != nxt["new_page"]:
+                    break
+            cur["old_text"] = (cur["old_text"] + "\n\n" + nxt["old_text"]).strip()
+            cur["new_text"] = (cur["new_text"] + "\n\n" + nxt["new_text"]).strip()
+            cur["old_para_ids"].extend(nxt["old_para_ids"])
+            cur["new_para_ids"].extend(nxt["new_para_ids"])
+            j += 1
+        merged.append(cur)
+        i = j
+    return merged
+
+
+def _range_label(ids: list[str], page: int | None) -> str:
+    if not ids:
+        return ""
+    first = ids[0]
+    last = ids[-1]
+    label = "Paragraph "
+    if first == last:
+        label += first
+    else:
+        label += f"{first}–{last}"
+    if page:
+        label += f" (page {page})"
+    return label
 
 
 _SENTENCE_CSS = """
@@ -701,17 +1067,31 @@ def sentence_diff_html(
     *,
     gpt_enrich: bool = False,
     max_gpt_items: int | None = 200,
+    post_match: bool = True,
+    post_match_window: int = DEFAULT_POST_MATCH_WINDOW,
+    post_match_sim: float = DEFAULT_POST_MATCH_SIM,
+    post_match_containment: float = DEFAULT_POST_MATCH_CONTAIN,
+    post_match_same_page: bool = True,
 ) -> str:
     old_di = _load_di_root(old_path)
     new_di = _load_di_root(new_path)
-    old_pages = extract_pages_text(old_di, logger)
-    new_pages = extract_pages_text(new_di, logger)
-    logger.info("Pages – old: %d, new: %d", len(old_pages), len(new_pages))
+    old_paras = extract_paragraph_blocks(old_di, logger)
+    new_paras = extract_paragraph_blocks(new_di, logger)
+    logger.info("Paragraphs – old: %d, new: %d", len(old_paras), len(new_paras))
 
-    old_chunks = chunk_pages(old_pages, "v1", min_words, logger)
-    new_chunks = chunk_pages(new_pages, "v2", min_words, logger)
+    old_chunks = chunk_pages(old_paras, "v1", min_words, logger)
+    new_chunks = chunk_pages(new_paras, "v2", min_words, logger)
 
     diffs = align_dp(client, old_chunks, new_chunks, tau, logger)
+    if post_match:
+        diffs = postprocess_unmatched_pairs(
+            diffs,
+            logger,
+            window=post_match_window,
+            sim=post_match_sim,
+            containment=post_match_containment,
+            same_page=post_match_same_page,
+        )
     if gpt_enrich:
         enrich_with_gpt(client, diffs, logger, max_items=max_gpt_items)
 
@@ -723,41 +1103,83 @@ def sentence_diff_html(
         "<tbody>\n",
     ]
 
-    for d in diffs:
-        row_class = html.escape(d.kind)
+    rows: list[dict] = []
+    for _, group_label, group in _group_diffs_by_paragraph(diffs):
+        old_texts = [d.old.text for d in group if d.old is not None]
+        new_texts = [d.new.text for d in group if d.new is not None]
+        old_text = "\n\n".join(t.strip() for t in old_texts if t.strip()).strip()
+        new_text = "\n\n".join(t.strip() for t in new_texts if t.strip()).strip()
+
+        has_old = bool(old_text)
+        has_new = bool(new_text)
+        if has_old and has_new:
+            kind = "same" if all(d.kind == "same" for d in group) else "modified"
+        elif has_new:
+            kind = "added"
+        else:
+            kind = "deleted"
+
+        old_meta_chunk = next((d.old for d in group if d.old is not None), None)
+        new_meta_chunk = next((d.new for d in group if d.new is not None), None)
+
+        details = [d for d in group if d.details]
+
+        rows.append(
+            {
+                "kind": kind,
+                "old_text": old_text,
+                "new_text": new_text,
+                "old_para_ids": [old_meta_chunk.para_id] if old_meta_chunk else [],
+                "new_para_ids": [new_meta_chunk.para_id] if new_meta_chunk else [],
+                "old_page": old_meta_chunk.page if old_meta_chunk else None,
+                "new_page": new_meta_chunk.page if new_meta_chunk else None,
+                "details": details,
+                "group_label": group_label,
+                "is_heading": _is_heading_text(old_text or new_text),
+            }
+        )
+
+    rows = _merge_same_rows(rows)
+
+    for row in rows:
         left = ""
         right = ""
+
+        if row["kind"] == "modified":
+            left, right = _token_diff_two_col_html(row["old_text"], row["new_text"])
+        elif row["kind"] == "added":
+            right = html.escape(row["new_text"])
+        elif row["kind"] == "deleted":
+            left = html.escape(row["old_text"])
+        else:
+            left = html.escape(row["old_text"])
+            right = html.escape(row["new_text"])
+
         meta_left = ""
         meta_right = ""
 
-        if d.old is not None:
-            flag = " (embedding failed)" if d.old.embedding_failed else ""
-            meta_left = f"{html.escape(d.old.id)}{flag}"
-        if d.new is not None:
-            flag = " (embedding failed)" if d.new.embedding_failed else ""
-            sim = f" sim={d.sim:.3f}" if (d.kind == "modified" and d.sim is not None) else ""
-            meta_right = f"{html.escape(d.new.id)}{flag}{sim}"
+        if row["details"]:
+            summary_lines = []
+            for d in row["details"]:
+                old_id = d.old.id if d.old else ""
+                new_id = d.new.id if d.new else ""
+                header = f"{old_id} → {new_id}".strip()
+                if header:
+                    summary_lines.append(header)
+                summary_lines.append(d.details or "")
+            right += (
+                "<details><summary>LLM summary</summary>"
+                f"<pre>{html.escape('\\n\\n'.join(summary_lines))}</pre>"
+                "</details>"
+            )
 
-        if d.kind == "added":
-            right = html.escape(d.new.text)
-        elif d.kind == "deleted":
-            left = html.escape(d.old.text)
-        elif d.kind == "same":
-            left = html.escape(d.old.text)
-            right = html.escape(d.new.text)
-        else:  # modified
-            left, right = _token_diff_two_col_html(d.old.text, d.new.text)
-            if d.details:
-                right += (
-                    "<details><summary>LLM summary</summary>"
-                    f"<pre>{html.escape(d.details)}</pre>"
-                    "</details>"
-                )
-
+        row_class = html.escape(row["kind"])
+        meta_left_html = f"<span class='meta'>{html.escape(meta_left)}</span>" if meta_left else ""
+        meta_right_html = f"<span class='meta'>{html.escape(meta_right)}</span>" if meta_right else ""
         parts.append(
             f"<tr class='{row_class}'>"
-            f"<td><span class='meta'>{meta_left}</span>{left}</td>"
-            f"<td><span class='meta'>{meta_right}</span>{right}</td>"
+            f"<td>{meta_left_html}{left}</td>"
+            f"<td>{meta_right_html}{right}</td>"
             "</tr>\n"
         )
 
@@ -883,14 +1305,14 @@ def diff_tables(
     for j_new, tbl_new in enumerate(new):
         if j_new in mapping:
             i_old = mapping[j_new]
-            yield (j_new + 1, _diff_table_cells(old[i_old], tbl_new))
+            yield (j_new + 1, _diff_table_cells(old[i_old], tbl_new), "matched")
         else:
-            yield (j_new + 1, _diff_table_cells([], tbl_new))
+            yield (j_new + 1, _diff_table_cells([], tbl_new), "added")
 
     # tables removed from old
     for i_old, tbl_old in enumerate(old):
         if i_old not in matched_old:
-            yield (len(new) + i_old + 1, _diff_table_cells(tbl_old, []))
+            yield (len(new) + i_old + 1, _diff_table_cells(tbl_old, []), "removed")
 
 
 _TABLE_CSS = """
@@ -901,6 +1323,7 @@ _TABLE_CSS = """
   td.changed{background:#ffeacc;}
   del{background:#ffb3b3;text-decoration:line-through;}
   ins{background:#b3ffb3;text-decoration:none;}
+  .table-removed{padding:0.75rem 1rem;border:1px dashed #cc6666;background:#fff3f3;}
 </style>
 """
 
@@ -922,7 +1345,13 @@ def tables_diff_html(
     tbl_rep = list(diff_tables(tbls_old, tbls_new, thr))
 
     sections = []
-    for idx, grid in tbl_rep:
+    for idx, grid, status in tbl_rep:
+        if status == "removed":
+            sections.append(
+                f"<h3>Table {idx}</h3>"
+                "<div class='table-removed'>TABLE REMOVED FOR CLARITY CHECK DOCUMENT END</div>"
+            )
+            continue
         rows = ["<tr>" + "".join(_cell_html(o, n, st) for o, n, st in row) + "</tr>"
                 for row in grid]
         sections.append(f"<h3>Table {idx}</h3><table class='diff'>\n"
@@ -947,6 +1376,11 @@ def build_combined_report(
     api_key: Optional[str] = None,
     gpt_enrich: bool = False,
     max_gpt_items: int | None = 200,
+    post_match: bool = True,
+    post_match_window: int = DEFAULT_POST_MATCH_WINDOW,
+    post_match_sim: float = DEFAULT_POST_MATCH_SIM,
+    post_match_containment: float = DEFAULT_POST_MATCH_CONTAIN,
+    post_match_same_page: bool = True,
 ) -> None:
     """Internal helper that orchestrates the two diff sections and writes HTML."""
 
@@ -973,6 +1407,11 @@ def build_combined_report(
         logger,
         gpt_enrich=gpt_enrich,
         max_gpt_items=max_gpt_items,
+        post_match=post_match,
+        post_match_window=post_match_window,
+        post_match_sim=post_match_sim,
+        post_match_containment=post_match_containment,
+        post_match_same_page=post_match_same_page,
     )
 
     logger.info("▶ Table diff …")
@@ -1006,6 +1445,11 @@ def diff_documents(
     api_key: str | None = None,
     gpt_enrich: bool = False,
     max_gpt_items: int | None = 200,
+    post_match: bool = True,
+    post_match_window: int = DEFAULT_POST_MATCH_WINDOW,
+    post_match_sim: float = DEFAULT_POST_MATCH_SIM,
+    post_match_containment: float = DEFAULT_POST_MATCH_CONTAIN,
+    post_match_same_page: bool = True,
 ) -> pathlib.Path:
     """High-level wrapper that mirrors the old CLI but is now plainly callable.
 
@@ -1029,6 +1473,16 @@ def diff_documents(
         If True, add an LLM summary for some modified sentences (token diff is always shown).
     max_gpt_items : int | None, default 200
         Maximum number of modified sentences to enrich with GPT (None = no limit).
+    post_match : bool, default True
+        If True, try to pair nearby added/deleted rows that appear to be the same sentence.
+    post_match_window : int, default 3
+        Max forward distance (in diff rows) to search for a pairing candidate.
+    post_match_sim : float, default 0.80
+        Similarity threshold for post-matching.
+    post_match_containment : float, default 0.75
+        Containment threshold for post-matching (old contained in new).
+    post_match_same_page : bool, default True
+        If True, only pair chunks that are on the same page (or adjacent page).
 
     Returns
     -------
@@ -1051,6 +1505,11 @@ def diff_documents(
         api_key=api_key,
         gpt_enrich=gpt_enrich,
         max_gpt_items=max_gpt_items,
+        post_match=post_match,
+        post_match_window=post_match_window,
+        post_match_sim=post_match_sim,
+        post_match_containment=post_match_containment,
+        post_match_same_page=post_match_same_page,
     )
     return out_path.resolve()
 
