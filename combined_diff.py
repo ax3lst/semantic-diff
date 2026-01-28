@@ -40,6 +40,7 @@ from __future__ import annotations
 
 # ————————————————————————————————————————————————————— imports ———
 from collections import defaultdict
+import bisect
 import datetime
 from difflib import SequenceMatcher
 import hashlib
@@ -99,6 +100,7 @@ class ParagraphBlock:
     page: int
     order: int
     text: str
+    source_index: int | None = None
 
 
 @dataclass
@@ -347,7 +349,7 @@ def extract_paragraph_blocks(di: Dict[str, Any], logger) -> List[ParagraphBlock]
             page = _paragraph_page(pr) or 0
             order_by_page[page] += 1
             pid = f"p{page}-para{order_by_page[page]}"
-            blocks.append(ParagraphBlock(pid, page, order_by_page[page], content))
+            blocks.append(ParagraphBlock(pid, page, order_by_page[page], content, idx))
 
         if blocks:
             pages = {b.page for b in blocks}
@@ -363,7 +365,7 @@ def extract_paragraph_blocks(di: Dict[str, Any], logger) -> List[ParagraphBlock]
         for para in _split_page_into_paragraphs(page_txt):
             order_by_page[page_no] += 1
             pid = f"p{page_no}-para{order_by_page[page_no]}"
-            blocks.append(ParagraphBlock(pid, page_no, order_by_page[page_no], para))
+            blocks.append(ParagraphBlock(pid, page_no, order_by_page[page_no], para, None))
     logger.info("Paragraphs extracted via fallback pages[] – %d blocks", len(blocks))
     return blocks
 
@@ -991,7 +993,7 @@ def _group_diffs_by_paragraph(diffs: List[Diff]) -> List[tuple[str, str, List[Di
     return groups
 
 
-def _merge_same_rows(rows: List[dict]) -> List[dict]:
+def _merge_same_rows(rows: List[dict], *, break_para_ids: set[str] | None = None) -> List[dict]:
     if not rows:
         return rows
     merged: list[dict] = []
@@ -1007,6 +1009,13 @@ def _merge_same_rows(rows: List[dict]) -> List[dict]:
             nxt = rows[j]
             if nxt["kind"] != cur["kind"] or nxt["is_heading"]:
                 break
+            if break_para_ids:
+                cur_ids = set(cur.get("old_para_ids", []) + cur.get("new_para_ids", []))
+                nxt_ids = set(nxt.get("old_para_ids", []) + nxt.get("new_para_ids", []))
+                if cur_ids & break_para_ids:
+                    break
+                if nxt_ids & break_para_ids:
+                    break
             if cur["old_page"] is not None and nxt["old_page"] is not None:
                 if cur["old_page"] != nxt["old_page"]:
                     break
@@ -1023,19 +1032,48 @@ def _merge_same_rows(rows: List[dict]) -> List[dict]:
     return merged
 
 
-def _range_label(ids: list[str], page: int | None) -> str:
-    if not ids:
-        return ""
-    first = ids[0]
-    last = ids[-1]
-    label = "Paragraph "
-    if first == last:
-        label += first
-    else:
-        label += f"{first}–{last}"
-    if page:
-        label += f" (page {page})"
-    return label
+def _interleave_rows_and_tables(
+    rows: List[dict],
+    table_entries: List[TableEntry],
+) -> List[tuple[str, object]]:
+    if not table_entries:
+        return [("text", row) for row in rows]
+
+    old_index: dict[str, int] = {}
+    new_index: dict[str, int] = {}
+    page_index: dict[int, int] = {}
+    for idx, row in enumerate(rows):
+        for pid in row.get("old_para_ids", []):
+            old_index.setdefault(pid, idx)
+        for pid in row.get("new_para_ids", []):
+            new_index.setdefault(pid, idx)
+        if row.get("old_page"):
+            page_index[row["old_page"]] = idx
+        if row.get("new_page"):
+            page_index[row["new_page"]] = idx
+
+    items: list[tuple[float, str, object]] = []
+    for idx, row in enumerate(rows):
+        items.append((float(idx), "text", row))
+
+    for entry in table_entries:
+        anchor_idx = None
+        if entry.anchor_id:
+            if entry.anchor_side == "new":
+                anchor_idx = new_index.get(entry.anchor_id)
+            elif entry.anchor_side == "old":
+                anchor_idx = old_index.get(entry.anchor_id)
+            else:
+                anchor_idx = new_index.get(entry.anchor_id) or old_index.get(entry.anchor_id)
+        if anchor_idx is None and entry.anchor_page:
+            anchor_idx = page_index.get(entry.anchor_page)
+        if anchor_idx is None:
+            anchor_idx = len(rows) - 1 if rows else 0
+        pos = float(anchor_idx) + 0.5 + (entry.order * 1e-3)
+        items.append((pos, "table", entry))
+
+    items.sort(key=lambda t: t[0])
+    return [(kind, obj) for _, kind, obj in items]
 
 
 _SENTENCE_CSS = """
@@ -1049,10 +1087,15 @@ _SENTENCE_CSS = """
   table.docdiff tr.modified{background:#fff6db;}
   table.docdiff tr.added{background:#eaffea;}
   table.docdiff tr.deleted{background:#ffecec;}
+  table.docdiff tr.table-row td{background:#fafafa;}
   table.docdiff del{background:#ffb3b3;text-decoration:line-through;}
   table.docdiff ins{background:#b3ffb3;text-decoration:none;}
   table.docdiff details{margin-top:0.35rem;}
   table.docdiff pre{white-space:pre-wrap;margin:0.25rem 0 0 0;}
+  .table-embed{white-space:normal;}
+  .table-embed .table-title{font-weight:600;margin:0 0 0.5rem 0;}
+  .table-embed table.diff{margin:0.5rem 0 0 0;width:100%;}
+  .table-embed table.diff td{white-space:normal;}
 </style>
 """
 
@@ -1072,6 +1115,8 @@ def sentence_diff_html(
     post_match_sim: float = DEFAULT_POST_MATCH_SIM,
     post_match_containment: float = DEFAULT_POST_MATCH_CONTAIN,
     post_match_same_page: bool = True,
+    embed_tables: bool = True,
+    table_thr: float = DEFAULT_TABLE_THR,
 ) -> str:
     old_di = _load_di_root(old_path)
     new_di = _load_di_root(new_path)
@@ -1098,6 +1143,7 @@ def sentence_diff_html(
     parts: list[str] = [
         "<h1>Document Comparison (Old → New)</h1>\n",
         _SENTENCE_CSS,
+        _TABLE_CSS,
         "<table class='docdiff'>\n",
         "<thead><tr><th style='width:50%;'>Old</th><th style='width:50%;'>New</th></tr></thead>\n",
         "<tbody>\n",
@@ -1139,9 +1185,27 @@ def sentence_diff_html(
             }
         )
 
-    rows = _merge_same_rows(rows)
+    table_entries: list[TableEntry] = []
+    anchor_ids: set[str] = set()
+    if embed_tables:
+        old_tables = _extract_tables_with_anchor(old_di, old_paras)
+        new_tables = _extract_tables_with_anchor(new_di, new_paras)
+        table_entries = _build_table_entries(old_tables, new_tables, table_thr)
+        anchor_ids = {e.anchor_id for e in table_entries if e.anchor_id}
 
-    for row in rows:
+    rows = _merge_same_rows(rows, break_para_ids=anchor_ids)
+
+    for kind, item in _interleave_rows_and_tables(rows, table_entries):
+        if kind == "table":
+            entry = item
+            table_html = _render_table_entry_html(entry)
+            parts.append(
+                "<tr class='table-row'>"
+                f"<td colspan='2'>{table_html}</td>"
+                "</tr>\n"
+            )
+            continue
+        row = item
         left = ""
         right = ""
 
@@ -1230,6 +1294,133 @@ def _pull_tables(di: Dict[str, Any]) -> List[Dict[str, Any]]:
     if "analyzeResult" in di and "tables" in di["analyzeResult"]:
         return di["analyzeResult"]["tables"]
     return []
+
+
+@dataclass
+class TableInfo:
+    index: int
+    page: int
+    para_id: str | None
+    matrix: List[List[str]]
+
+
+@dataclass
+class TableEntry:
+    status: str  # matched | added | removed
+    old: TableInfo | None
+    new: TableInfo | None
+    anchor_id: str | None
+    anchor_page: int | None
+    anchor_side: str  # new | old | none
+    order: int
+
+
+def _extract_tables_with_anchor(
+    di: Dict[str, Any],
+    paragraphs: List[ParagraphBlock],
+) -> List[TableInfo]:
+    tables = _pull_tables(di)
+    if not tables:
+        return []
+    para_by_idx = {p.source_index: p for p in paragraphs if p.source_index is not None}
+    available_idx = sorted(k for k in para_by_idx.keys() if k is not None)
+    infos: list[TableInfo] = []
+    for idx, tbl in enumerate(tables):
+        para_id = None
+        page = 0
+        para_indices: set[int] = set()
+        for cell in tbl.get("cells", []) or []:
+            for el in cell.get("elements", []) or []:
+                if not isinstance(el, str):
+                    continue
+                m = re.search(r"/paragraphs/(\d+)", el)
+                if m:
+                    para_indices.add(int(m.group(1)))
+        if para_indices:
+            for pi in sorted(para_indices):
+                pb = para_by_idx.get(pi)
+                if pb is not None:
+                    para_id = pb.id
+                    page = pb.page
+                    break
+            if para_id is None and available_idx:
+                min_idx = min(para_indices)
+                pos = bisect.bisect_right(available_idx, min_idx) - 1
+                if pos >= 0:
+                    pb = para_by_idx.get(available_idx[pos])
+                else:
+                    pb = para_by_idx.get(available_idx[0])
+                if pb is not None:
+                    para_id = pb.id
+                    page = pb.page
+        if page == 0:
+            br = tbl.get("boundingRegions") if isinstance(tbl.get("boundingRegions"), list) else []
+            if br and isinstance(br[0], dict) and "pageNumber" in br[0]:
+                page = int(br[0].get("pageNumber") or 0)
+        infos.append(TableInfo(idx, page, para_id, _build_table_matrix(tbl)))
+    return infos
+
+
+def _build_table_entries(
+    old_tables: List[TableInfo],
+    new_tables: List[TableInfo],
+    thr: float,
+) -> List[TableEntry]:
+    if not old_tables and not new_tables:
+        return []
+    mapping = _match_table_pairs([t.matrix for t in new_tables], [t.matrix for t in old_tables], thr)
+    matched_old = set(mapping.values())
+    entries: list[TableEntry] = []
+
+    for j_new, new_tbl in enumerate(new_tables):
+        if j_new in mapping:
+            i_old = mapping[j_new]
+            old_tbl = old_tables[i_old]
+            anchor_id = new_tbl.para_id or old_tbl.para_id
+            anchor_page = new_tbl.page or old_tbl.page
+            anchor_side = "new" if new_tbl.para_id else "old"
+            entries.append(
+                TableEntry(
+                    "matched",
+                    old_tbl,
+                    new_tbl,
+                    anchor_id,
+                    anchor_page or None,
+                    anchor_side,
+                    new_tbl.index,
+                )
+            )
+        else:
+            anchor_id = new_tbl.para_id
+            anchor_page = new_tbl.page
+            entries.append(
+                TableEntry(
+                    "added",
+                    None,
+                    new_tbl,
+                    anchor_id,
+                    anchor_page or None,
+                    "new",
+                    new_tbl.index,
+                )
+            )
+
+    for i_old, old_tbl in enumerate(old_tables):
+        if i_old not in matched_old:
+            anchor_id = old_tbl.para_id
+            anchor_page = old_tbl.page
+            entries.append(
+                TableEntry(
+                    "removed",
+                    old_tbl,
+                    None,
+                    anchor_id,
+                    anchor_page or None,
+                    "old",
+                    len(new_tables) + old_tbl.index,
+                )
+            )
+    return entries
 
 
 def _build_table_matrix(tbl: Dict[str, Any]) -> List[List[str]]:
@@ -1335,6 +1526,40 @@ def _cell_html(old: str, new: str, st: str) -> str:
             f"<ins>{html.escape(new)}</ins></td>")
 
 
+def _table_title(entry: TableEntry) -> str:
+    if entry.new is not None:
+        idx = entry.new.index + 1
+    elif entry.old is not None:
+        idx = entry.old.index + 1
+    else:
+        idx = 0
+    label = f"Table {idx}" if idx else "Table"
+    if entry.status == "added":
+        label += " (added)"
+    elif entry.status == "removed":
+        label += " (removed)"
+    return label
+
+
+def _render_table_entry_html(entry: TableEntry) -> str:
+    title = _table_title(entry)
+    if entry.status == "removed":
+        return (
+            f"<div class='table-embed'><div class='table-title'>{html.escape(title)}</div>"
+            "<div class='table-removed'>TABLE REMOVED FOR CLARITY CHECK DOCUMENT END</div>"
+            "</div>"
+        )
+    old_tbl = entry.old.matrix if entry.old is not None else []
+    new_tbl = entry.new.matrix if entry.new is not None else []
+    grid = _diff_table_cells(old_tbl, new_tbl)
+    rows = ["<tr>" + "".join(_cell_html(o, n, st) for o, n, st in row) + "</tr>"
+            for row in grid]
+    return (
+        f"<div class='table-embed'><div class='table-title'>{html.escape(title)}</div>"
+        f"<table class='diff'>\n{''.join(rows)}\n</table></div>"
+    )
+
+
 def tables_diff_html(
     old_path: pathlib.Path,
     new_path: pathlib.Path,
@@ -1381,6 +1606,7 @@ def build_combined_report(
     post_match_sim: float = DEFAULT_POST_MATCH_SIM,
     post_match_containment: float = DEFAULT_POST_MATCH_CONTAIN,
     post_match_same_page: bool = True,
+    embed_tables: bool = True,
 ) -> None:
     """Internal helper that orchestrates the two diff sections and writes HTML."""
 
@@ -1412,10 +1638,14 @@ def build_combined_report(
         post_match_sim=post_match_sim,
         post_match_containment=post_match_containment,
         post_match_same_page=post_match_same_page,
+        embed_tables=embed_tables,
+        table_thr=thr,
     )
 
-    logger.info("▶ Table diff …")
-    tbl_html = tables_diff_html(old_path, new_path, thr)
+    tbl_html = ""
+    if not embed_tables:
+        logger.info("▶ Table diff …")
+        tbl_html = "<hr style='margin:4rem 0;'>\n" + tables_diff_html(old_path, new_path, thr)
 
     # Compose single HTML doc
     html_doc = (
@@ -1423,7 +1653,6 @@ def build_combined_report(
         f"<title>Document diff report</title>"
         "</head><body style='margin:2rem;'>\n"
         + ai_html
-        + "<hr style='margin:4rem 0;'>\n"
         + tbl_html
         + "\n</body></html>"
     )
@@ -1450,6 +1679,7 @@ def diff_documents(
     post_match_sim: float = DEFAULT_POST_MATCH_SIM,
     post_match_containment: float = DEFAULT_POST_MATCH_CONTAIN,
     post_match_same_page: bool = True,
+    embed_tables: bool = True,
 ) -> pathlib.Path:
     """High-level wrapper that mirrors the old CLI but is now plainly callable.
 
@@ -1483,6 +1713,8 @@ def diff_documents(
         Containment threshold for post-matching (old contained in new).
     post_match_same_page : bool, default True
         If True, only pair chunks that are on the same page (or adjacent page).
+    embed_tables : bool, default True
+        If True, embed table diffs inside the main table instead of a separate section.
 
     Returns
     -------
@@ -1510,6 +1742,7 @@ def diff_documents(
         post_match_sim=post_match_sim,
         post_match_containment=post_match_containment,
         post_match_same_page=post_match_same_page,
+        embed_tables=embed_tables,
     )
     return out_path.resolve()
 
